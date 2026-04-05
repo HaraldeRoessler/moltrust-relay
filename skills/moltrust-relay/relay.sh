@@ -27,21 +27,35 @@ case "$command" in
       const peersDir = dir + '/peers';
       fs.mkdirSync(peersDir, { recursive: true });
 
-      if (fs.existsSync(dir + '/private.key')) {
-        console.log(JSON.stringify({status: 'exists', publicKey: fs.readFileSync(dir + '/public.key', 'utf8').trim()}));
+      if (fs.existsSync(dir + '/private.key') && fs.existsSync(dir + '/sign.key')) {
+        console.log(JSON.stringify({
+          status: 'exists',
+          encryptionKey: fs.readFileSync(dir + '/public.key', 'utf8').trim(),
+          signingKey: fs.readFileSync(dir + '/sign.pub', 'utf8').trim(),
+        }));
         process.exit(0);
       }
 
-      const keypair = crypto.generateKeyPairSync('x25519');
-      const privDer = keypair.privateKey.export({ type: 'pkcs8', format: 'der' });
-      const pubDer = keypair.publicKey.export({ type: 'spki', format: 'der' });
-      const privHex = privDer.toString('hex');
-      const pubHex = pubDer.toString('hex');
+      // X25519 keypair for encryption
+      const encKp = crypto.generateKeyPairSync('x25519');
+      const privDer = encKp.privateKey.export({ type: 'pkcs8', format: 'der' });
+      const pubDer = encKp.publicKey.export({ type: 'spki', format: 'der' });
+      fs.writeFileSync(dir + '/private.key', privDer.toString('hex'), { mode: 0o600 });
+      fs.writeFileSync(dir + '/public.key', pubDer.toString('hex'), { mode: 0o644 });
 
-      fs.writeFileSync(dir + '/private.key', privHex, { mode: 0o600 });
-      fs.writeFileSync(dir + '/public.key', pubHex, { mode: 0o644 });
+      // Ed25519 keypair for signing
+      const signKp = crypto.generateKeyPairSync('ed25519');
+      const signPrivDer = signKp.privateKey.export({ type: 'pkcs8', format: 'der' });
+      const signPubDer = signKp.publicKey.export({ type: 'spki', format: 'der' });
+      fs.writeFileSync(dir + '/sign.key', signPrivDer.toString('hex'), { mode: 0o600 });
+      fs.writeFileSync(dir + '/sign.pub', signPubDer.toString('hex'), { mode: 0o644 });
 
-      console.log(JSON.stringify({status: 'generated', publicKey: pubHex, keysDir: dir}));
+      console.log(JSON.stringify({
+        status: 'generated',
+        encryptionKey: pubDer.toString('hex'),
+        signingKey: signPubDer.toString('hex'),
+        keysDir: dir,
+      }));
     " 2>&1
     ;;
 
@@ -60,13 +74,16 @@ case "$command" in
       const dir = '$KEYS_DIR';
       const peersDir = dir + '/peers';
 
-      if (!fs.existsSync(dir + '/private.key')) {
+      if (!fs.existsSync(dir + '/private.key') || !fs.existsSync(dir + '/sign.key')) {
         console.log(JSON.stringify({error: 'No keys. Run: relay.sh keygen'}));
         process.exit(1);
       }
       const privHex = fs.readFileSync(dir + '/private.key', 'utf8').trim();
       const pubHex = fs.readFileSync(dir + '/public.key', 'utf8').trim();
+      const signKeyHex = fs.readFileSync(dir + '/sign.key', 'utf8').trim();
+      const signPubHex = fs.readFileSync(dir + '/sign.pub', 'utf8').trim();
       const privateKey = crypto.createPrivateKey({ key: Buffer.from(privHex, 'hex'), format: 'der', type: 'pkcs8' });
+      const signKey = crypto.createPrivateKey({ key: Buffer.from(signKeyHex, 'hex'), format: 'der', type: 'pkcs8' });
 
       function loadPeerKey() {
         const peerFile = peersDir + '/' + '$target_did'.replace(/:/g, '_') + '.pub';
@@ -85,15 +102,22 @@ case "$command" in
         let encrypted = cipher.update('$message', 'utf8', 'hex');
         encrypted += cipher.final('hex');
         const tag = cipher.getAuthTag().toString('hex');
+
+        // Sign the ciphertext with Ed25519
+        const dataToSign = iv.toString('hex') + tag + encrypted;
+        const signature = crypto.sign(null, Buffer.from(dataToSign), signKey).toString('hex');
+
         ws.send(JSON.stringify({
           type: 'encrypted_message',
           to: '$target_did',
           iv: iv.toString('hex'),
           tag: tag,
           ciphertext: encrypted,
-          senderPublicKey: pubHex
+          senderPublicKey: pubHex,
+          senderSigningKey: signPubHex,
+          signature: signature,
         }));
-        console.log(JSON.stringify({status: 'sent', encrypted: true, to: '$target_did'}));
+        console.log(JSON.stringify({status: 'sent', encrypted: true, signed: true, to: '$target_did'}));
       }
 
       const url = '$RELAY_URL'.replace('https://', 'wss://').replace('http://', 'ws://');
@@ -102,7 +126,7 @@ case "$command" in
       const timeout = setTimeout(() => { ws.close(); if (!messageSent) console.log(JSON.stringify({status:'timeout'})); }, 15000);
 
       ws.on('open', () => {
-        ws.send(JSON.stringify({type:'key_exchange', publicKey: pubHex}));
+        ws.send(JSON.stringify({type:'key_exchange', publicKey: pubHex, signingKey: signPubHex}));
         // Check if we already have the peer key
         const peerPubKey = loadPeerKey();
         if (peerPubKey) {
@@ -120,6 +144,9 @@ case "$command" in
           const pf = peersDir + '/' + msg.from.replace(/:/g, '_') + '.pub';
           fs.mkdirSync(peersDir, { recursive: true });
           fs.writeFileSync(pf, msg.publicKey);
+          if (msg.signingKey) {
+            fs.writeFileSync(peersDir + '/' + msg.from.replace(/:/g, '_') + '.sign', msg.signingKey);
+          }
           console.log(JSON.stringify({status: 'peer_key_received', from: msg.from}));
           if (!messageSent && msg.from === '$target_did') {
             const peerPubKey = crypto.createPublicKey({ key: Buffer.from(msg.publicKey, 'hex'), format: 'der', type: 'spki' });
@@ -154,12 +181,13 @@ case "$command" in
       const peersDir = dir + '/peers';
 
       // Load own keys
-      if (!fs.existsSync(dir + '/private.key')) {
+      if (!fs.existsSync(dir + '/private.key') || !fs.existsSync(dir + '/sign.key')) {
         console.log(JSON.stringify({error: 'No keys. Run: relay.sh keygen'}));
         process.exit(1);
       }
       const privHex = fs.readFileSync(dir + '/private.key', 'utf8').trim();
       const pubHex = fs.readFileSync(dir + '/public.key', 'utf8').trim();
+      const signPubHex = fs.readFileSync(dir + '/sign.pub', 'utf8').trim();
       const privateKey = crypto.createPrivateKey({ key: Buffer.from(privHex, 'hex'), format: 'der', type: 'pkcs8' });
 
       const url = '$RELAY_URL'.replace('https://', 'wss://').replace('http://', 'ws://');
@@ -168,7 +196,7 @@ case "$command" in
 
       ws.on('open', () => {
         // Announce public key
-        ws.send(JSON.stringify({type:'key_exchange', publicKey: pubHex}));
+        ws.send(JSON.stringify({type:'key_exchange', publicKey: pubHex, signingKey: signPubHex}));
         console.log(JSON.stringify({status:'connected',did:'$AGENT_DID',encrypted:true}));
       });
       ws.on('message', (data) => {
@@ -179,6 +207,9 @@ case "$command" in
           const pf = peersDir + '/' + msg.from.replace(/:/g, '_') + '.pub';
           fs.mkdirSync(peersDir, { recursive: true });
           fs.writeFileSync(pf, msg.publicKey);
+          if (msg.signingKey) {
+            fs.writeFileSync(peersDir + '/' + msg.from.replace(/:/g, '_') + '.sign', msg.signingKey);
+          }
           console.log(JSON.stringify({status: 'peer_key_saved', from: msg.from}));
           return;
         }
@@ -186,6 +217,37 @@ case "$command" in
         // Handle encrypted message
         if (msg.type === 'encrypted_message' && msg.ciphertext && msg.senderPublicKey) {
           try {
+            // Verify signature first
+            let signatureValid = false;
+            if (msg.signature && msg.senderSigningKey) {
+              const signerPubKey = crypto.createPublicKey({ key: Buffer.from(msg.senderSigningKey, 'hex'), format: 'der', type: 'spki' });
+              const dataToVerify = msg.iv + msg.tag + msg.ciphertext;
+              signatureValid = crypto.verify(null, Buffer.from(dataToVerify), signerPubKey, Buffer.from(msg.signature, 'hex'));
+
+              // Check signing key matches stored peer key
+              if (msg.from) {
+                const storedSignFile = peersDir + '/' + msg.from.replace(/:/g, '_') + '.sign';
+                if (fs.existsSync(storedSignFile)) {
+                  const storedKey = fs.readFileSync(storedSignFile, 'utf8').trim();
+                  if (storedKey !== msg.senderSigningKey) {
+                    console.log(JSON.stringify({
+                      error: 'SIGNING KEY MISMATCH — possible impersonation',
+                      from: msg.from,
+                      expected: storedKey.substring(0, 20) + '...',
+                      received: msg.senderSigningKey.substring(0, 20) + '...',
+                    }));
+                    return;
+                  }
+                }
+              }
+            }
+
+            if (!signatureValid && msg.signature) {
+              console.log(JSON.stringify({error: 'INVALID SIGNATURE — message tampered or forged', from: msg.from}));
+              return;
+            }
+
+            // Decrypt
             const peerPubKey = crypto.createPublicKey({ key: Buffer.from(msg.senderPublicKey, 'hex'), format: 'der', type: 'spki' });
             const shared = crypto.diffieHellman({ privateKey, publicKey: peerPubKey });
             const key = crypto.createHash('sha256').update(shared).digest();
@@ -199,14 +261,17 @@ case "$command" in
               from: msg.from,
               content: decrypted,
               encrypted: true,
-              verified: true,
-              timestamp: msg.timestamp
+              signed: signatureValid,
+              signatureVerified: signatureValid,
+              timestamp: msg.timestamp,
             }));
 
-            // Save peer key
+            // Save peer keys
             if (msg.from) {
-              const pf = peersDir + '/' + msg.from.replace(/:/g, '_') + '.pub';
-              fs.writeFileSync(pf, msg.senderPublicKey);
+              fs.writeFileSync(peersDir + '/' + msg.from.replace(/:/g, '_') + '.pub', msg.senderPublicKey);
+              if (msg.senderSigningKey) {
+                fs.writeFileSync(peersDir + '/' + msg.from.replace(/:/g, '_') + '.sign', msg.senderSigningKey);
+              }
             }
           } catch (e) {
             console.log(JSON.stringify({error: 'Decryption failed: ' + e.message, raw: msg}));
