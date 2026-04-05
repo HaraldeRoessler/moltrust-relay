@@ -8,7 +8,7 @@ import os
 import json
 import logging
 from datetime import datetime, timezone
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header
 import httpx
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -54,9 +54,15 @@ async def healthz():
     }
 
 
+def _check_admin_secret(x_relay_secret: str = Header(alias="X-Relay-Secret", default="")):
+    if not RELAY_SECRET or x_relay_secret != RELAY_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid relay secret")
+
+
 @app.get("/agents")
-async def list_agents():
-    """List currently connected agents."""
+async def list_agents(x_relay_secret: str = Header(alias="X-Relay-Secret", default="")):
+    """List currently connected agents. Requires X-Relay-Secret header."""
+    _check_admin_secret(x_relay_secret)
     return {
         "agents": [
             {"did": did, "connected": True}
@@ -67,8 +73,9 @@ async def list_agents():
 
 
 @app.get("/messages")
-async def list_messages(limit: int = 50):
-    """List recent messages (audit log)."""
+async def list_messages(limit: int = 50, x_relay_secret: str = Header(alias="X-Relay-Secret", default="")):
+    """List recent messages (audit log). Requires X-Relay-Secret header."""
+    _check_admin_secret(x_relay_secret)
     return {"messages": message_log[-limit:], "total": len(message_log)}
 
 
