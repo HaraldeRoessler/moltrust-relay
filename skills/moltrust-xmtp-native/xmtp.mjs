@@ -109,6 +109,7 @@ switch (command) {
     await conversation.send(JSON.stringify({
       from_did: AGENT_DID,
       content: message,
+      type: "question",
       timestamp: new Date().toISOString(),
     }));
 

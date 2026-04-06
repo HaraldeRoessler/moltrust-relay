@@ -1,16 +1,19 @@
 #!/usr/bin/env node
 /**
- * MolTrust XMTP Daemon — Background message listener (NO auto-reply)
+ * MolTrust XMTP Daemon — Agent-to-Agent conversation
  *
- * Receives XMTP messages and writes them to an inbox file.
- * OpenClaw reads the inbox and decides how to respond.
- * Responses are sent explicitly via xmtp.mjs send.
+ * Receives XMTP messages, forwards to OpenClaw agent for processing,
+ * sends the agent's response back via XMTP.
+ *
+ * Loop prevention: only responds to messages marked as "question" type.
+ * Responses are marked as "answer" type — answers are never replied to.
  *
  * Start: node22 daemon.mjs &
  * Stop:  kill $(cat /home/node/.openclaw/xmtp-data/daemon.pid)
  */
 import { Agent } from "@xmtp/agent-sdk";
 import { writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
+import { execSync } from "child_process";
 import { join } from "path";
 
 const DATA_DIR = process.env.XMTP_DATA_DIR || "/home/node/.openclaw/xmtp-data";
@@ -41,9 +44,36 @@ async function verifyTrust(did) {
   }
 }
 
-// Write PID
+function askOpenClaw(question) {
+  // Use OpenClaw's own agent with the globally configured model
+  try {
+    const safeQuestion = question.replace(/"/g, '\\"').replace(/\n/g, ' ').substring(0, 500);
+    const result = execSync(
+      `openclaw agent -m "${safeQuestion}" --agent main --local --json`,
+      { timeout: 45000, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
+    );
+    // Parse output — may have multiple lines, find the JSON response
+    const lines = result.trim().split("\n");
+    for (const line of lines.reverse()) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.text) return parsed.text;
+        if (parsed.response) return parsed.response;
+      } catch {}
+    }
+    // Fallback: return raw text (strip ANSI codes)
+    const clean = result.replace(/\x1b\[[0-9;]*m/g, "").trim();
+    return clean.substring(0, 500) || null;
+  } catch (e) {
+    const stderr = e.stderr?.replace(/\x1b\[[0-9;]*m/g, "").trim() || "";
+    log(`OpenClaw error: ${stderr || e.message}`);
+    return null;
+  }
+}
+
+// PID file
 writeFileSync(PID_FILE, String(process.pid));
-log(`Starting XMTP daemon (PID ${process.pid})`);
+log(`Starting (PID ${process.pid})`);
 
 function cleanup() {
   try { unlinkSync(PID_FILE); } catch {}
@@ -53,12 +83,12 @@ function cleanup() {
 process.on("SIGTERM", cleanup);
 process.on("SIGINT", cleanup);
 
-// Start
+// Start XMTP
 const agent = await Agent.createFromEnv();
 const startTime = Date.now();
 
-log(`XMTP address: ${agent.address}`);
-log(`MolTrust DID: ${AGENT_DID}`);
+log(`XMTP: ${agent.address}`);
+log(`DID: ${AGENT_DID}`);
 
 agent.on("text", async (ctx) => {
   const text = ctx.message?.content || "";
@@ -68,46 +98,66 @@ agent.on("text", async (ctx) => {
   if (senderInbox === agent.inboxId) return;
 
   // Parse
-  let content, fromDid;
+  let content, fromDid, msgType;
   try {
     const parsed = JSON.parse(text);
     content = parsed.content || text;
     fromDid = parsed.from_did;
+    msgType = parsed.type || "question";
     if (fromDid === AGENT_DID) return;
+    // Never reply to answers — prevents loops
+    if (msgType === "answer") {
+      log(`Answer from ${fromDid}: ${content.substring(0, 80)}`);
+      appendFileSync(INBOX_FILE, JSON.stringify({ from_did: fromDid, content, type: "answer", timestamp: new Date().toISOString() }) + "\n");
+      return;
+    }
   } catch {
     content = text;
     fromDid = null;
+    msgType = "question";
   }
 
   // Trust check
-  let trust = null;
   if (fromDid) {
-    trust = await verifyTrust(fromDid);
+    const trust = await verifyTrust(fromDid);
     if (!trust.verified) {
       log(`Rejected: ${fromDid} not verified`);
       return;
     }
-    log(`Received from ${fromDid}: ${content.substring(0, 80)}`);
-  } else {
-    log(`Received from ${senderInbox}: ${content.substring(0, 80)}`);
   }
 
-  // Write to inbox file (JSONL — one JSON per line)
-  const entry = {
-    from_did: fromDid,
-    from_inbox: senderInbox,
-    content,
-    trust: trust ? { verified: trust.verified, reputation: trust.reputation } : null,
-    timestamp: new Date().toISOString(),
-    protocol: "xmtp",
-  };
+  log(`Question from ${fromDid || senderInbox}: ${content.substring(0, 80)}`);
 
-  appendFileSync(INBOX_FILE, JSON.stringify(entry) + "\n");
-  log(`Inbox: ${INBOX_FILE} (new message)`);
+  // Save to inbox
+  appendFileSync(INBOX_FILE, JSON.stringify({
+    from_did: fromDid, content, type: "question",
+    timestamp: new Date().toISOString(), protocol: "xmtp",
+  }) + "\n");
+
+  // Forward to OpenClaw agent
+  const prompt = fromDid
+    ? `Du hast eine XMTP Nachricht von Agent ${fromDid} erhalten: "${content}". Antworte auf diese Nachricht.`
+    : `Du hast eine XMTP Nachricht erhalten: "${content}". Antworte darauf.`;
+
+  log(`Forwarding to OpenClaw...`);
+  const response = await askOpenClaw(prompt);
+
+  if (response) {
+    // Send response back via XMTP as "answer" type
+    await ctx.conversation.send(JSON.stringify({
+      from_did: AGENT_DID,
+      content: response,
+      type: "answer",
+      timestamp: new Date().toISOString(),
+    }));
+    log(`Replied: ${response.substring(0, 80)}`);
+  } else {
+    log(`No response from OpenClaw`);
+  }
 });
 
 agent.on("start", () => {
-  log("XMTP agent running — listening for messages (no auto-reply)");
+  log("Listening (questions → OpenClaw → answers)");
 });
 
 await agent.start();
