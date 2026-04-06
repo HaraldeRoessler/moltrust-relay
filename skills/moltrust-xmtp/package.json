@@ -1,9 +1,0 @@
-{
-  "name": "moltrust-xmtp",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@xmtp/node-sdk": "^1.0.0"
-  }
-}

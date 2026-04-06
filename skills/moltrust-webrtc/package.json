@@ -1,9 +1,0 @@
-{
-  "name": "moltrust-webrtc",
-  "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "werift": "^0.20.0",
-    "ws": "^8.0.0"
-  }
-}
