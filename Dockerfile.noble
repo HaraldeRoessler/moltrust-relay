@@ -1,0 +1,53 @@
+# OpenClaw on Ubuntu 24.04 (Noble) — glibc 2.39 for XMTP/Web3 native bindings
+# Takes the official OpenClaw build artifacts and runs them on Ubuntu Noble
+
+FROM ghcr.io/openclaw/openclaw:latest AS source
+
+FROM ubuntu:24.04
+
+# Install Node.js 24 (matching OpenClaw's version) + system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates git procps hostname lsof openssl python3 make g++ \
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rename ubuntu user to node (UID 1000, matching OpenClaw)
+RUN usermod -l node -d /home/node -m ubuntu && \
+    groupmod -n node ubuntu
+
+# Enable corepack for pnpm
+RUN corepack enable
+
+WORKDIR /app
+
+# Copy all OpenClaw artifacts from official image
+COPY --from=source --chown=node:node /app/dist ./dist
+COPY --from=source --chown=node:node /app/node_modules ./node_modules
+COPY --from=source --chown=node:node /app/package.json .
+COPY --from=source --chown=node:node /app/openclaw.mjs .
+COPY --from=source --chown=node:node /app/extensions ./extensions
+COPY --from=source --chown=node:node /app/skills ./skills
+COPY --from=source --chown=node:node /app/docs ./docs
+
+# Setup corepack/pnpm
+RUN corepack prepare "$(node -p "require('./package.json').packageManager")" --activate 2>/dev/null || true
+
+# OpenClaw CLI
+RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw && chmod 755 /app/openclaw.mjs
+
+# Install Node 22 as secondary binary for XMTP SDK compatibility
+RUN curl -fsSL https://nodejs.org/dist/v22.22.2/node-v22.22.2-linux-x64.tar.gz -o /tmp/node22.tar.gz \
+    && tar -xzf /tmp/node22.tar.gz -C /opt \
+    && ln -s /opt/node-v22.22.2-linux-x64/bin/node /usr/local/bin/node22 \
+    && rm /tmp/node22.tar.gz
+
+ENV NODE_ENV=production
+ENV OPENCLAW_BUNDLED_PLUGINS_DIR=/app/extensions
+
+USER node
+
+HEALTHCHECK --interval=3m --timeout=10s --start-period=15s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:18789/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
