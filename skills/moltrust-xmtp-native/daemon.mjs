@@ -384,4 +384,12 @@ setInterval(async () => {
 }, 2000);
 
 agent.on("start", () => log("Running"));
+
+// Keep alive — restart on unexpected exit
+process.on("uncaughtException", (e) => { log(`Uncaught: ${e.message}`); });
+process.on("unhandledRejection", (e) => { log(`Unhandled: ${e?.message || e}`); });
+
+// Heartbeat — log every 5 min so we know daemon is alive
+setInterval(() => { log("heartbeat"); }, 300000);
+
 await agent.start();
