@@ -312,28 +312,22 @@ agent.on("text", async (ctx) => {
     // Save to inbox
     appendFileSync(INBOX_FILE, JSON.stringify({ from_did: fromDid, content, round, timestamp: new Date().toISOString() }) + "\n");
 
-    // If previous conversation ended, reset counter for new conversation
+    // End conversation if max rounds reached — DO NOT auto-reset
     if (round > MAX_ROUNDS) {
       const c = loadConvs();
-      c[peer] = { round: 1 };
-      saveConvs(c);
-      log(`New conversation with ${peer} (previous ended)`);
-    }
-
-    // Re-read round after potential reset
-    const currentRound = getRound(peer);
-
-    // End conversation if max rounds reached
-    if (currentRound > MAX_ROUNDS) {
-      log(`Max rounds — ending conversation with ${peer}`);
-      try {
-        await ctx.conversation.send(JSON.stringify({
-          from_did: AGENT_DID, content: "Thanks for the conversation! We've reached the round limit.", finished: true, timestamp: new Date().toISOString(),
-        }));
-      } catch {}
-      // Generate report and notify owner
-      await generateReport(peer);
-      saveProcessedIds(processedMessages);
+      if (!c[peer]?.done) {
+        c[peer] = { round: round, done: true };
+        saveConvs(c);
+        log(`Max rounds — ending conversation with ${peer}`);
+        try {
+          await ctx.conversation.send(JSON.stringify({
+            from_did: AGENT_DID, content: "Thanks for the conversation! We've reached the round limit.", finished: true, timestamp: new Date().toISOString(),
+          }));
+        } catch {}
+        await generateReport(peer);
+        saveProcessedIds(processedMessages);
+      }
+      // Silently ignore further messages from this peer until manually reset
       return;
     }
 
