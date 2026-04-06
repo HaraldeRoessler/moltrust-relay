@@ -44,6 +44,14 @@ node22 xmtp.mjs map <did> <0x...>  # Map DID to address
 node22 xmtp.mjs status    # Check connection
 ```
 
+## Read the last conversation report
+
+```bash
+cat /home/node/.openclaw/xmtp-data/last_report.md
+```
+
+When a conversation ends, the daemon generates a summary report and attempts to send a Telegram notification.
+
 ## Stop the daemon
 
 ```bash

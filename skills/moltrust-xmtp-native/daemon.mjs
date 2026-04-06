@@ -17,6 +17,7 @@ const AGENT_DID = process.env.MOLTRUST_AGENT_DID || "";
 const MOLTRUST_API = process.env.MOLTRUST_API_URL || "https://api.moltrust.ch";
 const MOLTRUST_KEY = process.env.MOLTRUST_API_KEY || "";
 const MAX_ROUNDS = parseInt(process.env.MAX_CONVERSATION_ROUNDS || "5");
+const REPORT_FILE = join(DATA_DIR, "last_report.md");
 
 mkdirSync(DATA_DIR, { recursive: true });
 
@@ -169,6 +170,83 @@ async function askLLM(peer, question) {
   return null;
 }
 
+// ─── Report Back ─────────────────────────────────────────────────────────────
+
+async function generateReport(peer) {
+  const history = histories[peer] || [];
+  if (history.length === 0) return;
+
+  // Build transcript
+  const transcript = history.map((m, i) => {
+    const who = m.role === "user" ? peer.substring(0, 20) : AGENT_DID.substring(0, 20);
+    return `${who}: ${m.content.substring(0, 200)}`;
+  }).join("\n\n");
+
+  // Ask LLM for summary
+  const apiKey = process.env.LLM_API_KEY || process.env.FIREWORKS_API_KEY || _detectedModel?.apiKey || "";
+  const apiUrl = process.env.LLM_API_URL || _detectedModel?.apiUrl || "https://api.fireworks.ai/inference/v1/chat/completions";
+  const model = process.env.LLM_MODEL || _detectedModel?.model || "accounts/fireworks/models/qwen3p6-plus";
+
+  let summary = "";
+  if (apiKey) {
+    try {
+      const resp = await fetch(apiUrl, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: "Summarize this agent-to-agent conversation in 3-5 bullet points. Focus on key decisions, agreements, and open questions. Be concise." },
+            { role: "user", content: transcript },
+          ],
+          max_tokens: 1000,
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        summary = data.choices?.[0]?.message?.content || "";
+        if (summary.includes("</think>")) summary = summary.split("</think>").pop().trim();
+      }
+    } catch (e) { log(`Summary LLM error: ${e.message}`); }
+  }
+
+  // Build report
+  const report = [
+    `# Agent Conversation Report`,
+    `**Date:** ${new Date().toISOString()}`,
+    `**My DID:** ${AGENT_DID}`,
+    `**Peer DID:** ${peer}`,
+    `**Rounds:** ${history.length / 2}`,
+    `**Trust:** Verified ✅`,
+    `**Protocol:** XMTP (E2E encrypted, P2P)`,
+    ``,
+    `## Summary`,
+    summary || "(Summary generation failed)",
+    ``,
+    `## Transcript`,
+    transcript,
+  ].join("\n");
+
+  // Save report
+  writeFileSync(REPORT_FILE, report);
+  log(`Report saved: ${REPORT_FILE}`);
+
+  // Send notification via Telegram (through OpenClaw message CLI)
+  try {
+    const { execSync } = await import("child_process");
+    const notifyMsg = `📋 Agent conversation completed with ${peer}.\n\n${summary || "Check report at " + REPORT_FILE}`;
+    execSync(
+      `openclaw message send --channel telegram --message "${notifyMsg.replace(/"/g, '\\"').replace(/\n/g, '\\n').substring(0, 500)}" 2>/dev/null`,
+      { timeout: 15000, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
+    );
+    log(`Telegram notification sent`);
+  } catch (e) {
+    log(`Telegram notification failed: ${e.message?.substring(0, 50)}`);
+    // Not critical — report is saved to file
+  }
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 writeFileSync(PID_FILE, String(process.pid));
@@ -212,9 +290,10 @@ agent.on("text", async (ctx) => {
       finished = false;
     }
 
-    // Skip finished conversations
+    // Skip finished conversations — but generate report first
     if (finished) {
       log(`Conversation ended by ${fromDid}`);
+      await generateReport(fromDid || senderInbox);
       return;
     }
 
@@ -252,6 +331,8 @@ agent.on("text", async (ctx) => {
           from_did: AGENT_DID, content: "Thanks for the conversation! We've reached the round limit.", finished: true, timestamp: new Date().toISOString(),
         }));
       } catch {}
+      // Generate report and notify owner
+      await generateReport(peer);
       saveProcessedIds(processedMessages);
       return;
     }
