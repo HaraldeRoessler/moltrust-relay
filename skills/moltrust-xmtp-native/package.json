@@ -1,0 +1,9 @@
+{
+  "name": "moltrust-xmtp-native",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@xmtp/agent-sdk": "^1.0.0"
+  }
+}
