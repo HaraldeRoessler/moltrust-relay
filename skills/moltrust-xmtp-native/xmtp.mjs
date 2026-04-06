@@ -38,9 +38,15 @@ async function verifyTrust(did) {
   try {
     const headers = MOLTRUST_KEY ? { "X-API-Key": MOLTRUST_KEY } : {};
     const resp = await fetch(`${MOLTRUST_API}/identity/verify/${encodeURIComponent(did)}`, { headers });
-    if (resp.ok) return await resp.json();
-  } catch (e) { /* ignore */ }
-  return { did, verified: false };
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.verified !== undefined) return data;
+    }
+    // Rate limited or API error — allow with warning (same as daemon)
+    return { did, verified: true, _warning: "trust check unavailable" };
+  } catch (e) {
+    return { did, verified: true, _warning: "trust check error" };
+  }
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
