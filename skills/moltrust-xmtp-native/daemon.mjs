@@ -13,7 +13,6 @@
  */
 import { Agent } from "@xmtp/agent-sdk";
 import { writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
-import { execSync } from "child_process";
 import { join } from "path";
 
 const DATA_DIR = process.env.XMTP_DATA_DIR || "/home/node/.openclaw/xmtp-data";
@@ -44,29 +43,43 @@ async function verifyTrust(did) {
   }
 }
 
-function askOpenClaw(question) {
-  // Use OpenClaw's own agent with the globally configured model
+async function askOpenClaw(question) {
+  // Use Fireworks API directly — same model as OpenClaw's configured default
+  const apiKey = process.env.LLM_API_KEY || process.env.FIREWORKS_API_KEY || "";
+  const apiUrl = process.env.LLM_API_URL || "https://api.fireworks.ai/inference/v1/chat/completions";
+  const model = process.env.LLM_MODEL || "accounts/fireworks/models/kimi-k2p5";
+
+  if (!apiKey) {
+    log("No LLM API key configured");
+    return null;
+  }
+
   try {
-    const safeQuestion = question.replace(/"/g, '\\"').replace(/\n/g, ' ').substring(0, 500);
-    const result = execSync(
-      `openclaw agent -m "${safeQuestion}" --agent main --local --json`,
-      { timeout: 45000, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
-    );
-    // Parse output — may have multiple lines, find the JSON response
-    const lines = result.trim().split("\n");
-    for (const line of lines.reverse()) {
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed.text) return parsed.text;
-        if (parsed.response) return parsed.response;
-      } catch {}
+    const resp = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: `Du bist ein AI Agent mit der MolTrust DID ${AGENT_DID}. Du kommunizierst mit anderen verifizierten Agents über das XMTP Netzwerk. Antworte kurz und hilfreich.` },
+          { role: "user", content: question },
+        ],
+        max_tokens: 200,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (resp.ok) {
+      const data = await resp.json();
+      return data.choices?.[0]?.message?.content || null;
     }
-    // Fallback: return raw text (strip ANSI codes)
-    const clean = result.replace(/\x1b\[[0-9;]*m/g, "").trim();
-    return clean.substring(0, 500) || null;
+    log(`LLM error: HTTP ${resp.status}`);
+    return null;
   } catch (e) {
-    const stderr = e.stderr?.replace(/\x1b\[[0-9;]*m/g, "").trim() || "";
-    log(`OpenClaw error: ${stderr || e.message}`);
+    log(`LLM error: ${e.message}`);
     return null;
   }
 }
@@ -143,14 +156,17 @@ agent.on("text", async (ctx) => {
   const response = await askOpenClaw(prompt);
 
   if (response) {
-    // Send response back via XMTP as "answer" type
-    await ctx.conversation.send(JSON.stringify({
-      from_did: AGENT_DID,
-      content: response,
-      type: "answer",
-      timestamp: new Date().toISOString(),
-    }));
-    log(`Replied: ${response.substring(0, 80)}`);
+    try {
+      await ctx.conversation.send(JSON.stringify({
+        from_did: AGENT_DID,
+        content: response,
+        type: "answer",
+        timestamp: new Date().toISOString(),
+      }));
+      log(`Replied: ${response.substring(0, 80)}`);
+    } catch (e) {
+      log(`Send error: ${e.message}`);
+    }
   } else {
     log(`No response from OpenClaw`);
   }
