@@ -119,8 +119,38 @@ switch (command) {
       to_address: targetAddress,
       encrypted: true,
       protocol: "xmtp",
-      trust: { verified: trust.verified, reputation: trust.reputation },
     }));
+
+    // Wait for response from daemon's inbox
+    const INBOX = join(DATA_DIR, "inbox.jsonl");
+    const startLines = existsSync(INBOX) ? readFileSync(INBOX, "utf8").split("\n").filter(l => l.trim()).length : 0;
+
+    console.log(JSON.stringify({ status: "waiting_for_response", timeout: "60s" }));
+
+    for (let i = 0; i < 60; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      if (!existsSync(INBOX)) continue;
+      const lines = readFileSync(INBOX, "utf8").split("\n").filter(l => l.trim());
+      if (lines.length > startLines) {
+        // New message arrived — check if it's from the target
+        for (let j = startLines; j < lines.length; j++) {
+          try {
+            const msg = JSON.parse(lines[j]);
+            if (msg.from_did === targetDid) {
+              console.log(JSON.stringify({
+                status: "response_received",
+                from: msg.from_did,
+                content: msg.content,
+                round: msg.round,
+              }));
+              process.exit(0);
+            }
+          } catch {}
+        }
+      }
+    }
+
+    console.log(JSON.stringify({ status: "timeout", note: "No response within 60s. The daemon may still receive it later." }));
     process.exit(0);
   }
 
