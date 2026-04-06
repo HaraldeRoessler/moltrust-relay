@@ -3,7 +3,7 @@
  * MolTrust XMTP Daemon — Autonomous Agent-to-Agent Conversations
  *
  * Agents converse independently. Each conversation has a round limit.
- * Uses XMTP for P2P encrypted messaging + MolTrust for trust verification.
+ * Survives restarts — uses persistent dedup file + conversation state.
  *
  * Start: node22 daemon.mjs &
  * Stop:  kill $(cat /home/node/.openclaw/xmtp-data/daemon.pid)
@@ -23,19 +23,36 @@ mkdirSync(DATA_DIR, { recursive: true });
 const PID_FILE = join(DATA_DIR, "daemon.pid");
 const INBOX_FILE = join(DATA_DIR, "inbox.jsonl");
 const CONV_FILE = join(DATA_DIR, "conversations.json");
+const DEDUP_FILE = join(DATA_DIR, "processed_ids.json");
 
 function log(msg) { process.stderr.write(`[daemon] ${msg}\n`); }
 
-// ─── Conversation Tracking ───────────────────────────────────────────────────
+// ─── Persistent Dedup (survives restarts) ────────────────────────────────────
+
+function loadProcessedIds() {
+  try {
+    if (existsSync(DEDUP_FILE)) return new Set(JSON.parse(readFileSync(DEDUP_FILE, "utf8")));
+  } catch {}
+  return new Set();
+}
+
+function saveProcessedIds(ids) {
+  const arr = [...ids];
+  writeFileSync(DEDUP_FILE, JSON.stringify(arr.slice(-500)));
+}
+
+const processedMessages = loadProcessedIds();
+
+// ─── Conversation Tracking (persistent) ──────────────────────────────────────
 
 function loadConvs() {
-  if (existsSync(CONV_FILE)) return JSON.parse(readFileSync(CONV_FILE, "utf8"));
+  try {
+    if (existsSync(CONV_FILE)) return JSON.parse(readFileSync(CONV_FILE, "utf8"));
+  } catch {}
   return {};
 }
 
 function saveConvs(c) { writeFileSync(CONV_FILE, JSON.stringify(c)); }
-
-function getRound(peer) { return (loadConvs()[peer]?.round) || 0; }
 
 function incRound(peer) {
   const c = loadConvs();
@@ -43,6 +60,10 @@ function incRound(peer) {
   c[peer].round++;
   saveConvs(c);
   return c[peer].round;
+}
+
+function getRound(peer) {
+  return loadConvs()[peer]?.round || 0;
 }
 
 // ─── Trust ───────────────────────────────────────────────────────────────────
@@ -60,10 +81,43 @@ async function verifyTrust(did) {
 
 const histories = {};
 
+function detectOpenClawModel() {
+  // Try to read OpenClaw's configured model
+  const configPaths = [
+    "/home/node/.openclaw/settings.json",
+    "/home/node/.openclaw/openclaw.json",
+    "/home/node/.openclaw/config.json",
+  ];
+  for (const p of configPaths) {
+    try {
+      if (!existsSync(p)) continue;
+      const cfg = JSON.parse(readFileSync(p, "utf8"));
+      const providers = cfg.models?.providers || {};
+      for (const [name, prov] of Object.entries(providers)) {
+        if (prov.apiKey && prov.baseUrl && prov.models?.length > 0) {
+          const defaultModel = cfg.agents?.defaults?.model?.primary || "";
+          const modelId = defaultModel.replace(`${name}/`, "") || prov.models[0].id;
+          return {
+            apiKey: prov.apiKey,
+            apiUrl: `${prov.baseUrl}/chat/completions`,
+            model: modelId,
+            source: p,
+          };
+        }
+      }
+    } catch {}
+  }
+  return null;
+}
+
+const _detectedModel = detectOpenClawModel();
+if (_detectedModel) log(`Using OpenClaw model: ${_detectedModel.model} (from ${_detectedModel.source})`);
+
 async function askLLM(peer, question) {
-  const apiKey = process.env.LLM_API_KEY || process.env.FIREWORKS_API_KEY || "";
-  const apiUrl = process.env.LLM_API_URL || "https://api.fireworks.ai/inference/v1/chat/completions";
-  const model = process.env.LLM_MODEL || "accounts/fireworks/models/kimi-k2p5";
+  // Priority: env override > OpenClaw config > defaults
+  const apiKey = process.env.LLM_API_KEY || process.env.FIREWORKS_API_KEY || _detectedModel?.apiKey || "";
+  const apiUrl = process.env.LLM_API_URL || _detectedModel?.apiUrl || "https://api.fireworks.ai/inference/v1/chat/completions";
+  const model = process.env.LLM_MODEL || _detectedModel?.model || "accounts/fireworks/models/kimi-k2p5";
   if (!apiKey) { log("No LLM API key"); return null; }
 
   if (!histories[peer]) histories[peer] = [];
@@ -77,10 +131,10 @@ async function askLLM(peer, question) {
       body: JSON.stringify({
         model,
         messages: [
-          { role: "system", content: `Answer directly. No thinking, no explanation of your process. Just respond naturally to the message. Keep it under 3 sentences and ask a follow-up question.` },
+          { role: "system", content: "You are having a conversation with another AI agent over an encrypted P2P network. Respond naturally and concisely. Keep your answer under 3 sentences. Ask a follow-up question to continue the conversation." },
           ...histories[peer],
         ],
-        max_tokens: 150,
+        max_tokens: 300,
       }),
       signal: AbortSignal.timeout(30000),
     });
@@ -100,19 +154,14 @@ async function askLLM(peer, question) {
 writeFileSync(PID_FILE, String(process.pid));
 log(`PID ${process.pid}`);
 
-process.on("SIGTERM", () => { try { unlinkSync(PID_FILE); } catch {} process.exit(0); });
-process.on("SIGINT", () => { try { unlinkSync(PID_FILE); } catch {} process.exit(0); });
+process.on("SIGTERM", () => { saveProcessedIds(processedMessages); try { unlinkSync(PID_FILE); } catch {} process.exit(0); });
+process.on("SIGINT", () => { saveProcessedIds(processedMessages); try { unlinkSync(PID_FILE); } catch {} process.exit(0); });
 
 const agent = await Agent.createFromEnv();
 
-// Reset state on fresh start
-writeFileSync(CONV_FILE, "{}");
-const processedMessages = new Set();
-const startTimeMs = Date.now();
-
 log(`XMTP: ${agent.address}`);
 log(`DID: ${AGENT_DID}`);
-log(`Autonomous mode (max ${MAX_ROUNDS} rounds)`);
+log(`Autonomous mode (max ${MAX_ROUNDS} rounds, ${processedMessages.size} previously processed messages)`);
 
 agent.on("text", async (ctx) => {
   try {
@@ -122,21 +171,14 @@ agent.on("text", async (ctx) => {
     // Skip own messages
     if (senderInbox === agent.inboxId) return;
 
-    // Parse
-    // Skip old messages (sent before daemon started)
-    const msgSentAt = ctx.message?.sentAtNs ? Number(ctx.message.sentAtNs) / 1_000_000 :
-                      ctx.message?.sentAt ? new Date(ctx.message.sentAt).getTime() : Date.now();
-    if (msgSentAt < startTimeMs) return;
-
-    // Dedup
-    const msgId = ctx.message?.id || `${senderInbox}-${msgSentAt}`;
+    // Dedup — persistent across restarts
+    const msgId = ctx.message?.id || `${senderInbox}-${Date.now()}`;
     if (processedMessages.has(msgId)) return;
     processedMessages.add(msgId);
-    if (processedMessages.size > 1000) {
-      const arr = [...processedMessages]; processedMessages.clear();
-      arr.slice(-500).forEach(id => processedMessages.add(id));
-    }
+    // Save dedup state every 10 messages
+    if (processedMessages.size % 10 === 0) saveProcessedIds(processedMessages);
 
+    // Parse
     let content, fromDid, finished;
     try {
       const p = JSON.parse(text);
@@ -176,9 +218,10 @@ agent.on("text", async (ctx) => {
       log(`Max rounds — ending conversation with ${peer}`);
       try {
         await ctx.conversation.send(JSON.stringify({
-          from_did: AGENT_DID, content: "Thanks for the conversation!", finished: true, timestamp: new Date().toISOString(),
+          from_did: AGENT_DID, content: "Thanks for the conversation! We've reached the round limit.", finished: true, timestamp: new Date().toISOString(),
         }));
       } catch {}
+      saveProcessedIds(processedMessages);
       return;
     }
 
@@ -197,7 +240,6 @@ agent.on("text", async (ctx) => {
       log(`No LLM response`);
     }
   } catch (e) {
-    // Never crash the daemon
     log(`Error: ${e.message}`);
   }
 });
