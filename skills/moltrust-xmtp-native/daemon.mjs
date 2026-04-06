@@ -134,14 +134,34 @@ async function askLLM(peer, question) {
           { role: "system", content: "You are having a conversation with another AI agent over an encrypted P2P network. Respond naturally and concisely. Keep your answer under 3 sentences. Ask a follow-up question to continue the conversation." },
           ...histories[peer],
         ],
-        max_tokens: 300,
+        max_tokens: 1000,
       }),
       signal: AbortSignal.timeout(30000),
     });
     if (resp.ok) {
       const data = await resp.json();
-      const answer = data.choices?.[0]?.message?.content;
-      if (answer) histories[peer].push({ role: "assistant", content: answer });
+      let answer = data.choices?.[0]?.message?.content;
+      if (answer) {
+        // Strip reasoning/thinking from models that output chain-of-thought
+        if (answer.includes("</think>")) {
+          answer = answer.split("</think>").pop().trim();
+        } else if (answer.includes("Result:")) {
+          answer = answer.split("Result:").pop().trim();
+        } else if (answer.match(/^(Thinking|Let me|The user|I need to)/)) {
+          // Find the last paragraph that looks like an actual response
+          const lines = answer.split("\n").filter(l => l.trim());
+          const lastSubstantive = lines.filter(l =>
+            !l.match(/^(Thinking|Let me|The user|I need|Draft|Option|Check|Wait|Actually|Looking|Constraint|Requirement|Strategy|Goal|Key Point)/i) &&
+            !l.match(/^\d+\./) &&
+            !l.match(/^\*/) &&
+            l.length > 20
+          );
+          if (lastSubstantive.length > 0) {
+            answer = lastSubstantive.slice(-3).join(" ").trim();
+          }
+        }
+        histories[peer].push({ role: "assistant", content: answer });
+      }
       return answer;
     }
     log(`LLM: HTTP ${resp.status}`);
@@ -213,8 +233,19 @@ agent.on("text", async (ctx) => {
     // Save to inbox
     appendFileSync(INBOX_FILE, JSON.stringify({ from_did: fromDid, content, round, timestamp: new Date().toISOString() }) + "\n");
 
-    // End conversation if max rounds reached
+    // If previous conversation ended, reset counter for new conversation
     if (round > MAX_ROUNDS) {
+      const c = loadConvs();
+      c[peer] = { round: 1 };
+      saveConvs(c);
+      log(`New conversation with ${peer} (previous ended)`);
+    }
+
+    // Re-read round after potential reset
+    const currentRound = getRound(peer);
+
+    // End conversation if max rounds reached
+    if (currentRound > MAX_ROUNDS) {
       log(`Max rounds — ending conversation with ${peer}`);
       try {
         await ctx.conversation.send(JSON.stringify({
@@ -232,9 +263,9 @@ agent.on("text", async (ctx) => {
     if (response) {
       try {
         await ctx.conversation.send(JSON.stringify({
-          from_did: AGENT_DID, content: response, round, timestamp: new Date().toISOString(),
+          from_did: AGENT_DID, content: response, round: currentRound, timestamp: new Date().toISOString(),
         }));
-        log(`[R${round}] → ${response.substring(0, 80)}`);
+        log(`[R${currentRound}] → ${response.substring(0, 80)}`);
       } catch (e) { log(`Send error: ${e.message}`); }
     } else {
       log(`No LLM response`);
