@@ -103,36 +103,30 @@ switch (command) {
       process.exit(1);
     }
 
-    const agent = await Agent.createFromEnv();
+    // Write command for daemon to execute (daemon is the only XMTP client)
+    const CMD_FILE = join(DATA_DIR, "send_cmd.json");
+    const INBOX = join(DATA_DIR, "inbox.jsonl");
+    const startLines = existsSync(INBOX) ? readFileSync(INBOX, "utf8").split("\n").filter(l => l.trim()).length : 0;
 
-    const conversation = await agent.createDmWithAddress(targetAddress);
-    await conversation.send(JSON.stringify({
-      from_did: AGENT_DID,
+    writeFileSync(CMD_FILE, JSON.stringify({
+      to_did: targetDid,
+      to_address: targetAddress,
       content: message,
-      type: "question",
       timestamp: new Date().toISOString(),
     }));
 
     console.log(JSON.stringify({
-      status: "sent",
+      status: "sent_to_daemon",
       to_did: targetDid,
-      to_address: targetAddress,
-      encrypted: true,
-      protocol: "xmtp",
+      note: "Daemon will send via XMTP. Waiting for response...",
     }));
 
-    // Wait for response from daemon's inbox
-    const INBOX = join(DATA_DIR, "inbox.jsonl");
-    const startLines = existsSync(INBOX) ? readFileSync(INBOX, "utf8").split("\n").filter(l => l.trim()).length : 0;
-
-    console.log(JSON.stringify({ status: "waiting_for_response", timeout: "60s" }));
-
-    for (let i = 0; i < 60; i++) {
+    // Wait for response in inbox
+    for (let i = 0; i < 90; i++) {
       await new Promise(r => setTimeout(r, 1000));
       if (!existsSync(INBOX)) continue;
       const lines = readFileSync(INBOX, "utf8").split("\n").filter(l => l.trim());
       if (lines.length > startLines) {
-        // New message arrived — check if it's from the target
         for (let j = startLines; j < lines.length; j++) {
           try {
             const msg = JSON.parse(lines[j]);
@@ -150,7 +144,7 @@ switch (command) {
       }
     }
 
-    console.log(JSON.stringify({ status: "timeout", note: "No response within 60s. The daemon may still receive it later." }));
+    console.log(JSON.stringify({ status: "timeout", note: "No response within 90s." }));
     process.exit(0);
   }
 

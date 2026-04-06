@@ -356,5 +356,32 @@ agent.on("text", async (ctx) => {
   }
 });
 
+// ─── Send Command Watcher ────────────────────────────────────────────────────
+
+const CMD_FILE = join(DATA_DIR, "send_cmd.json");
+
+setInterval(async () => {
+  try {
+    if (!existsSync(CMD_FILE)) return;
+    const cmd = JSON.parse(readFileSync(CMD_FILE, "utf8"));
+    unlinkSync(CMD_FILE);
+
+    if (!cmd.to_address || !cmd.content) return;
+
+    log(`Send command: → ${cmd.to_did || cmd.to_address}: ${cmd.content.substring(0, 60)}`);
+
+    const conversation = await agent.createDmWithAddress(cmd.to_address);
+    await conversation.send(JSON.stringify({
+      from_did: AGENT_DID,
+      content: cmd.content,
+      type: "question",
+      timestamp: new Date().toISOString(),
+    }));
+    log(`Sent via daemon XMTP client`);
+  } catch (e) {
+    log(`Send command error: ${e.message}`);
+  }
+}, 2000);
+
 agent.on("start", () => log("Running"));
 await agent.start();
