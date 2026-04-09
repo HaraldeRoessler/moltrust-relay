@@ -5,17 +5,24 @@ FROM ghcr.io/openclaw/openclaw:latest AS source
 
 FROM ubuntu:24.04
 
-# Install Node.js 24 (matching OpenClaw's version) + system dependencies + Chromium for browser tool
+# Install Node.js 24 (matching OpenClaw's version) + system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates git procps hostname lsof openssl python3 make g++ \
-    chromium-browser fonts-liberation fonts-noto-color-emoji \
+    fonts-liberation fonts-noto-color-emoji gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Chromium path for OpenClaw browser tool
-ENV CHROME_PATH=/usr/bin/chromium-browser
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+# Install Google Chrome stable (works in containers, no snap)
+RUN curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+    && rm /tmp/chrome.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Chrome path for OpenClaw browser tool
+ENV CHROME_PATH=/usr/bin/google-chrome-stable
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
 # Rename ubuntu user to node (UID 1000, matching OpenClaw)
 RUN usermod -l node -d /home/node -m ubuntu && \
